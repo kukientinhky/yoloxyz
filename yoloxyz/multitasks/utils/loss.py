@@ -138,7 +138,7 @@ class ComputeLoss:
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
-        for k in 'na', 'nc', 'nl', 'anchors', 'nkpt':
+        for k in 'na', 'nc', 'nl', 'anchors':
             setattr(self, k, getattr(det, k))
 
     def __call__(self, p, targets):  # predictions, targets, model
