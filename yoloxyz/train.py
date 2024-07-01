@@ -33,6 +33,7 @@ from backbones.yolov7.utils.plots import plot_results, plot_evolution
 from multitasks.models.yolov7.yolo import ModelV7 as Model
 from multitasks.models.yolov7.experimental import attempt_load
 from multitasks.utils.loss import ComputeLoss
+from multitasks.utils.deyo_loss import RTDETRDetectionLoss
 from multitasks.utils.datasets import create_dataloader
 from multitasks.utils.plots import plot_labels, plot_images
 
@@ -97,7 +98,7 @@ def train(hyp, opt, device, tb_writer=None):
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
     # Model
-    headlayers = ['Detect', 'IDetect', 'IKeypoint', 'IDetectHead', 'IDetectBody'] # Define a list of Head layer
+    headlayers = ['Detect', 'IDetect', 'IKeypoint', 'IDetectHead', 'IDetectBody', 'RTDETRDecoder'] # Define a list of Head layer
     pretrained = weights.endswith('.pt')
     if pretrained:
         with torch_distributed_zero_first(rank):
@@ -248,9 +249,9 @@ def train(hyp, opt, device, tb_writer=None):
                     tb_writer.add_histogram('classes', c, 0)
 
             # Anchors
-            if not opt.noautoanchor:
-                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
-            model.half().float()  # pre-reduce anchor precision
+            # if not opt.noautoanchor:
+            #     check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+            # model.half().float()  # pre-reduce anchor precision
 
     # DDP mode
     if cuda and rank != -1:
@@ -289,7 +290,7 @@ def train(hyp, opt, device, tb_writer=None):
         }
     else:
         loss_fn = {
-            'IDetect' : ComputeLoss(model, detect_layer='IDetect') # Default
+            'RTDETRDecoder' : RTDETRDetectionLoss(nc= nc, use_vfl=True)  # Default
         }
         
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
@@ -317,15 +318,15 @@ def train(hyp, opt, device, tb_writer=None):
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(6, device=device)  # mean losses
+        mloss = torch.zeros(3, device=device)  # mean losses
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
-        logger.info(('\n' + '%10s' * 10) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'kpt', 'kptv' ,'total', 'labels', 'img_size'))
+        logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, batch, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             # if i>10:
             #     break
             ni = i + nb * epoch  # number integrated batches (since train start)
@@ -352,15 +353,52 @@ def train(hyp, opt, device, tb_writer=None):
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
+            # with amp.autocast(enabled=cuda):
+            #     model_outputs = model(imgs)  # forward
+            #     # if don't use multiloss, auto detect last layer and compute_loss
+                
+            #     _loss, _loss_item = [], []
+            #     for name, _loss_fn in loss_fn.items():
+            #         print(targets[name].shape)
+            #         _ls, _ls_items = _loss_fn(model_outputs[name], targets[name].to(device))
+            #         _loss.append(_ls)
+            #         _loss_item.append(_ls_items)
+
+            #     loss =  _loss[0] if len(_loss) == 1 else sum(_loss) / len(_loss)
+            #     loss_items = _loss_item[0] if len(_loss_item) == 1 else get_average_tensor(_loss_item)
+ 
+            #     if rank != -1:
+            #         loss *= opt.world_size  # gradient averaged between devices in DDP mode
+            #     if opt.quad:
+            #         loss *= 4.
+            x = batch["img"]
+            x = x.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+            # NOTE: preprocess gt_bbox and gt_labels to list.
+            bs = len(x)
+            batch_idx = batch["batch_idx"]
+            gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+            tgs = {
+                "cls": batch["cls"].to(x.device, dtype=torch.long).view(-1),
+                "bboxes": batch["bboxes"].to(device=x.device),
+                "batch_idx": batch_idx.to(x.device, dtype=torch.long).view(-1),
+                "gt_groups": gt_groups,
+            }
             with amp.autocast(enabled=cuda):
                 model_outputs = model(imgs)  # forward
                 # if don't use multiloss, auto detect last layer and compute_loss
-                
                 _loss, _loss_item = [], []
                 for name, _loss_fn in loss_fn.items():
-                    _ls, _ls_items = _loss_fn(model_outputs[name], targets[name].to(device))
-                    _loss.append(_ls)
-                    _loss_item.append(_ls_items)
+                    dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = model_outputs[name] #training  = true
+                    if dn_meta is None:
+                        dn_bboxes, dn_scores = None, None
+                    else:
+                        dn_bboxes, dec_bboxes = torch.split(dec_bboxes, dn_meta["dn_num_split"], dim=2)
+                        dn_scores, dec_scores = torch.split(dec_scores, dn_meta["dn_num_split"], dim=2)
+                    dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])  # (7, bs, 300, 4)
+                    dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
+                    _ls = _loss_fn((dec_bboxes, dec_scores), tgs, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta)
+                    _loss.append(sum(_ls.values()))
+                    _loss_item.append(torch.as_tensor([_ls[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=imgs.device))
 
                 loss =  _loss[0] if len(_loss) == 1 else sum(_loss) / len(_loss)
                 loss_items = _loss_item[0] if len(_loss_item) == 1 else get_average_tensor(_loss_item)
@@ -386,8 +424,8 @@ def train(hyp, opt, device, tb_writer=None):
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
                 tgt_name = list(targets.keys())
-                s = ('%10s' * 2 + '%10.4g' * 8) % (
-                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets[tgt_name[0]].shape[0], imgs.shape[-1])
+                s = ('%10s' * 2 + '%10.4g' * 6) % (
+                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, mloss.sum(), targets[tgt_name[0]].shape[0], imgs.shape[-1])
                 pbar.set_description(s)
 
                 # Plot

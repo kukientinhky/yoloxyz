@@ -112,7 +112,7 @@ def test(data,
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
     #jdict_kpt = [] if kpt_label else None
-    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    for batch_i, (img, batch, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         if dump_img:
             dst_file = os.path.join(save_dir, 'dump_img', 'images', 'val2017', Path(paths[0]).stem + '.png')
@@ -144,10 +144,30 @@ def test(data,
 
             #if not multiloss:
             out, train_out = pred[detect_layer][0], pred[detect_layer][1]    
-            
+            x = batch["img"]
+            x = x.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+            # NOTE: preprocess gt_bbox and gt_labels to list.
+            bs = len(x)
+            batch_idx = batch["batch_idx"]
+            gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+            tgs = {
+                "cls": batch["cls"].to(x.device, dtype=torch.long).view(-1),
+                "bboxes": batch["bboxes"].to(device=x.device),
+                "batch_idx": batch_idx.to(x.device, dtype=torch.long).view(-1),
+                "gt_groups": gt_groups,
+            }
             try:
                 if compute_loss:
-                    loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+                    dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = train_out
+                    if dn_meta is None:
+                        dn_bboxes, dn_scores = None, None
+                    else:
+                        dn_bboxes, dec_bboxes = torch.split(dec_bboxes, dn_meta["dn_num_split"], dim=2)
+                        dn_scores, dec_scores = torch.split(dec_scores, dn_meta["dn_num_split"], dim=2)
+                    dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])  # (7, bs, 300, 4)
+                    dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
+                    _ls = compute_loss[detect_layer]((dec_bboxes, dec_scores), tgs, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta)  
+                    loss += iter([_ls[k] for k in ["loss_giou", "loss_class", "loss_bbox"]]) # box, obj, cls
             except:
                 loss += compute_loss[detect_layer]([x.float() for x in train_out], targets)[1][:3]
             # Run NMS
@@ -158,7 +178,7 @@ def test(data,
                 targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
             lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
             t = time_synchronized()
-            out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, kpt_label=kpt_label, nc=model.yaml['nc'])
+            out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, kpt_label=kpt_label, nc=model.yaml['nc']) #note
             t1 += time_synchronized() - t
 
         # Statistics per image

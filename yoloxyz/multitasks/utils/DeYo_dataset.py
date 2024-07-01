@@ -424,17 +424,17 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Read cache
         cache.pop('hash')  # remove hash
         cache.pop('version')  # remove version
-        labels, shapes, self.segments = zip(*cache.values()) # <- change here
-
-        self.labels = list(labels)
-        self.shapes = np.array(shapes, dtype=np.float64)
-        self.img_files = list(cache.keys())  # update
+        # labels, shapes, self.segments = zip(*cache.values()) # <- change here
+        labels = cache["labels"]
+        self.labels = labels
+        self.shapes = [lb["shape"] for lb in labels]
+        self.img_files = [lb["im_file"] for lb in labels]  # update
         self.label_files = img2label_paths(cache.keys())  # update
         if single_cls:
             for x in self.labels:
                 x[:, 0] = 0
 
-        n = len(shapes)  # number of images
+        n = len(labels)  # number of images
         bi = np.floor(np.arange(n) / batch_size).astype(np.int16)  # batch index
         nb = bi[-1] + 1  # number of batches
         self.batch = bi  # batch index of image
@@ -481,7 +481,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
     def cache_labels(self, path=Path('./labels.cache'), prefix='', kpt_label=False):
         # Cache dataset labels, check images and read shapes
-        x = {}  # dict
+        x = {"labels": []}  # dict
         nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
         pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
         for i, (im_file, lb_file) in enumerate(pbar):
@@ -504,7 +504,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                             if len(line_label) == 5 and kpt_label:
                                 line_label = line_label + [0]*15
                             l.append(line_label)
-
                         #l = [x.split() for x in f.read().strip().splitlines()]
 
                         #if any([len(x) > 8 for x in l]) and not kpt_label:  # is segment
@@ -512,7 +511,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                         #    segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
                         #    l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
                         l = np.array(l, dtype=np.float32)
-
                     if len(l):
                         #assert (l >= 0).all(), 'negative labels' # change here
                         
@@ -532,6 +530,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                             assert (l[:, 1:5] <= 1).all(), '1::5 non-normalized or out of bounds coordinate labels'
 
                         assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
+                        x["labels"].append(
+                                dict(
+                                    im_file=im_file,
+                                    shape=shape,
+                                    cls=l[:, 0:1],  # n, 1
+                                    bboxes=l[:, 1:],  # n, 4
+                                    segments=segments,
+                                    keypoints=[],
+                                    normalized=True,
+                                    bbox_format="xywh",
+                                )
+                            )
                     else:
                         ne += 1  # label empty
                         l = np.zeros((0, kpt_label*2+5), dtype=np.float32) if kpt_label else np.zeros((0, 5), dtype=np.float32)
@@ -540,7 +550,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     nm += 1  # label missing
                     l = np.zeros((0,kpt_label*2+5), dtype=np.float32) if kpt_label else np.zeros((0, 5), dtype=np.float32)
 
-                x[im_file] = [l, shape, segments]
+                # x[im_file] = [l, shape, segments]
             except Exception as e:
                 nc += 1
                 print(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
@@ -677,18 +687,22 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
     @staticmethod
     def collate_fn(batch):
+        """Collates data samples into batches."""
         new_batch = {}
-        img, label, path, shapes = zip(*batch)  # transposed
-        img = torch.stack(img, 0)
-        for i, l in enumerate(label):
-            l[:, 0] = i  # add target image index for build_targets()
-            
-        label = torch.cat(label, 0)
-        new_batch['img'] = img
-        new_batch['cls'] = label[:, 1:2]
-        new_batch['bboxes'] = label[:, 2:6]
-        new_batch["batch_idx"] = torch.tensor(list(label[:, 0]))
-        return img, new_batch, {'RTDETRDecoder': label}, path, shapes
+        keys = batch[0].keys()
+        values = list(zip(*[list(b.values()) for b in batch]))
+        for i, k in enumerate(keys):
+            value = values[i]
+            if k == "img":
+                value = torch.stack(value, 0)
+            if k in ["masks", "keypoints", "bboxes", "cls", "segments", "obb"]:
+                value = torch.cat(value, 0)
+            new_batch[k] = value
+        new_batch["batch_idx"] = list(new_batch["batch_idx"])
+        for i in range(len(new_batch["batch_idx"])):
+            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
+        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        return new_batch
         
     @staticmethod
     def multi_collate_fn(batch):

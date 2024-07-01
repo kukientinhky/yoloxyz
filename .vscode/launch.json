@@ -6,7 +6,7 @@
   "configurations": [
     {
       "name": "Python: Current File",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "program": "${file}",
       "console": "integratedTerminal",
@@ -14,7 +14,19 @@
       "env": {
         "PYTHONPATH": "${cwd}",
       },
-      "justMyCode": true
+      "justMyCode": true, 
+      "args": ["--epochs", "300" ,
+      "--workers", "8",
+      "--device", "cpu",
+      "--batch-size", "64",
+      "--data", "yoloxyz/multitasks/cfg/data/widerface.yaml",
+      "--img", "640", "640",
+      "--cfg", "yoloxyz/multitasks/cfg/training/yolov7-tiny-multitask.yaml",
+      "--name", "yolov7-tiny-pretrain",
+      "--hyp", "yoloxyz/multitasks/cfg/hyp/hyp.yolov7.tiny.yaml",
+      "--weight", "weights/yolov7-tiny.pt",
+      "--detect-layer", "IDetect"
+    ]
     }
   ]
 }

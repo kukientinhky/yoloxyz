@@ -14,6 +14,7 @@ from backbones.yolov7.models.common import *
 from backbones.yolov7.models.experimental import MixConv2d, CrossConv, Conv, DWConv
 
 from yoloxyz.multitasks.models.yolov7.experimental import GhostBottleneck, GhostConv
+from yoloxyz.multitasks.heads.head_deyo import RTDETRDecoder
 from yoloxyz.multitasks.heads.head_layer import IDetectBody, IDetectHead, IKeypoint, HeadLayers
 from yoloxyz.multitasks.models.yolov7.common import NMS, SPP, Focus, ConvFocus, BottleneckCSP, C3, C3TR, StemBlock, \
     BottleneckCSPF, BottleneckCSP2, SPPCSP, SPPFCSPC, conv_bn_relu_maxpool, Shuffle_Block, DWConvblock, ADD
@@ -55,7 +56,7 @@ class ModelV7(nn.Module):
         # logger.info([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
         # Build strides, anchors Detect()
-        for m in self.model[-5:]:
+        for m in self.model[-6:]:
             if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IKeypoint) or isinstance(m, IDetectHead) or isinstance(m, IDetectBody):
                 s = 256  # 2x min stride
                 m.inplace = self.inplace
@@ -69,7 +70,11 @@ class ModelV7(nn.Module):
                 self._initialize_biases(m)  # only run once
                     #print(f'\n{m} Strides: %s' % m.stride.tolist(), "\n")
                     # logger.info('Strides: %s' % m.stride.tolist())
-
+            elif isinstance(m, RTDETRDecoder):
+                m.stride = torch.tensor([8, 16, 32])
+                self.stride = m.stride
+                m.bias_init() # only run once
+                # self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
         # Init weights, biases
         initialize_weights(self)
         self.info()
@@ -97,8 +102,8 @@ class ModelV7(nn.Module):
     def forward_once(self, x, profile=False):
         y, dt = [], []  # outputs
         model_outputs = dict()
-
-        for m in self.model:
+        isz = x.shape[2:]
+        for m in self.model[:-1]:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
 
@@ -115,18 +120,48 @@ class ModelV7(nn.Module):
                     logger.info(f"{'time (ms)':>10s} {'GFLOPS':>10s} {'params':>10s}  {'module'}")
                 logger.info(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
 
-            x = m(x)  # run
+            x = m(x) # run
+            y.append(x if m.i in self.save else None)  # save output          
 
-            if self.headlayers.check(m):
-                model_outputs.update({self.headlayers.get_name(m): x})
+            #if self.headlayers.check(m):
+        head = self.model[-1]
+        output = head([y[j] for j in head.f], batch = None, imgsz = isz)
+        model_outputs.update({self.headlayers.get_name(head): output})
 
-            y.append(x if m.i in self.save else None)  # save output
+            
 
         if profile:
             logger.info('%.1fms total' % sum(dt))
 
         return model_outputs
-
+    # def forward_once(self, x, profile=False, batch = None):
+    #     imgsz = x.shape[2:]
+    #     y, dt, embeddings = [], [], []  # outputs
+    #     with torch.no_grad():
+    #         for m in self.model[:-1]:  # except the head part
+    #             if m.f != -1:  # if not from previous layer
+    #                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+    #             if profile:
+    #                 o = thop.profile(m, inputs=(x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
+    #                 t = time_synchronized()
+    #                 for _ in range(10):
+    #                     _ = m(x)
+    #                 dt.append((time_synchronized() - t) * 100)
+    #                 if m == self.model[0]:
+    #                     logger.info(f"{'time (ms)':>10s} {'GFLOPS':>10s} {'params':>10s}  {'module'}")
+    #                 logger.info(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
+    #             x = m(x)  # run
+    #             y.append(x if m.i in self.save else None)  # save output
+    #             # if visualize:
+    #             #     feature_visualization(x, m.type, m.i, save_dir=visualize)
+    #             # if embed and m.i in embed:
+    #             #     embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+    #             #     if m.i == max(embed):
+    #             #         return torch.unbind(torch.cat(embeddings, 1), dim=0)
+    #     head = self.model[-1]
+    #     x = head([y[j] for j in head.f], batch, imgsz)  # head inference
+    #     return x
+    
     def _descale_pred(self, p, flips, scale, img_size):
         # de-scale predictions following augmented inference (inverse operation)
         if self.inplace:
@@ -173,6 +208,9 @@ class ModelV7(nn.Module):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.fuseforward  # update forward
+            elif isinstance(m, RepConv):
+                #print(f" fuse_repvgg_block")
+                m.fuse_repvgg_block()
         self.info()
         return self
 
@@ -218,7 +256,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, DWConv, MixConv2d, Focus, ConvFocus, CrossConv, BottleneckCSP, C3, C3TR, BottleneckCSPF, BottleneckCSP2, SPPCSP, SPPCSPC, SPPFCSPC, SPPF, conv_bn_relu_maxpool, Shuffle_Block, DWConvblock, StemBlock]:
+        if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, DWConv, RepConv, MixConv2d, Focus, ConvFocus, CrossConv, BottleneckCSP, C3, C3TR, BottleneckCSPF, BottleneckCSP2, SPPCSP, SPPCSPC, SPPFCSPC, SPPF, conv_bn_relu_maxpool, Shuffle_Block, DWConvblock, StemBlock]:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
@@ -242,6 +280,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 args[1] = [list(range(args[1] * 2))] * len(f)
             if 'dw_conv_kpt' in d.keys():
                 args_dict = {"dw_conv_kpt" : d['dw_conv_kpt']}
+        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
+            args.insert(1, [ch[x] for x in f])
         elif m is ReOrg:
             c2 = ch[f] * 4
         elif m is Contract:

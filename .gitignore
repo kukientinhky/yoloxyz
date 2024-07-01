@@ -159,3 +159,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 weights
+run.sh
+data
+runs
+samples
+testcuda.py
+test.ipynb
