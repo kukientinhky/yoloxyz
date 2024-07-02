@@ -18,7 +18,7 @@ from backbones.yolov7.utils.torch_utils import select_device, time_synchronized
 
 from multitasks.models.yolov7.experimental import attempt_load
 from multitasks.utils.datasets import create_dataloader
-from multitasks.utils.general import non_max_suppression, scale_coords
+from multitasks.utils.general import non_max_suppression, scale_coords, postprocess
 from multitasks.utils.plots import plot_images
 
 
@@ -109,7 +109,7 @@ def test(data,
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    loss = torch.zeros(3, device=device)
+    #loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
     #jdict_kpt = [] if kpt_label else None
     loss_dict = {}
@@ -145,6 +145,7 @@ def test(data,
 
             #if not multiloss:
             out, train_out = pred[detect_layer][0], pred[detect_layer][1]    
+            print(out.shape)
             x = batch["img"]
             x = x.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
             # NOTE: preprocess gt_bbox and gt_labels to list.
@@ -176,18 +177,21 @@ def test(data,
             except:
                 loss += compute_loss[detect_layer]([x.float() for x in train_out], targets)[1][:3]
             # Run NMS
-            if kpt_label:
-                num_points = (targets.shape[1]//2 - 1)
-                targets[:, 2:] *= torch.Tensor([width, height]*num_points).to(device)  # to pixels
-            else:
-                targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
-            lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
+            # if kpt_label:
+            #     num_points = (targets.shape[1]//2 - 1)
+            #     targets[:, 2:] *= torch.Tensor([width, height]*num_points).to(device)  # to pixels
+            # else:
+            #     targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
+            # lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
+            # t = time_synchronized()
+            # out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, kpt_label=kpt_label, nc=model.yaml['nc']) #note
+            # t1 += time_synchronized() - t
             t = time_synchronized()
-            #out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, kpt_label=kpt_label, nc=model.yaml['nc']) #note
+            out = postprocess(out)
             t1 += time_synchronized() - t
 
         # Statistics per image
-        for si, pred in enumerate(out):
+        for si, pred in enumerate(out): 
             # if len(pred)>0 and torch.max(pred[:,4])>0.3:
             #     with open(save_dir / 'persons.txt' , 'a') as f:
             #         path = Path(paths[si])
